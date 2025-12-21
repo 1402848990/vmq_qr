@@ -1,6 +1,6 @@
 """
-mitmproxy 8.0 周期发送WS消息（5秒一次 + 仅输出业务日志）
-核心：异步周期任务 + 避免死循环 + 纯净业务日志
+mitmproxy 8.0 周期发送WS消息 + 异步识别二维码图片存MySQL
+核心：异步周期任务 + 图片异步识别 + MySQL去重存储 + 纯净日志
 """
 import asyncio
 import json
@@ -10,9 +10,13 @@ from datetime import datetime
 from mitmproxy import options, http, ctx
 from mitmproxy.tools.dump import DumpMaster
 import sys
-from mitmproxy.websocket import WebSocketMessage
+import aiohttp
+import aiomysql
+from PIL import Image
+from pyzbar import pyzbar
+import io
 
-# ========== 全局日志配置（屏蔽所有冗余日志） ==========
+# ========== 全局日志配置 ==========
 logging.getLogger("mitmproxy").setLevel(logging.CRITICAL)
 logging.getLogger("mitmproxy.http").setLevel(logging.CRITICAL)
 logging.getLogger("mitmproxy.websocket").setLevel(logging.CRITICAL)
@@ -24,54 +28,128 @@ for handler in logging.root.handlers[:]:
 PROXY_HOST = "0.0.0.0"
 PROXY_PORT = 8080
 # 发送间隔：30秒
-SEND_INTERVAL = 15
+SEND_INTERVAL = 30
+
+# MySQL 配置（请按实际修改）
+MYSQL_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "123456",
+    "db": "vmq_qr",
+    "charset": "utf8mb4"
+}
+
+# 全局队列 & DB 连接池
+image_queue = asyncio.Queue()
+db_pool = None
+
+
+async def init_db():
+    global db_pool
+    db_pool = await aiomysql.create_pool(**MYSQL_CONFIG)
+
+
+async def is_url_exists(url: str) -> bool:
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT 1 FROM qrcode_images WHERE url = %s LIMIT 1", (url,))
+            return await cur.fetchone() is not None
+
+
+async def save_qrcode_image(url: str, group_name: str, sender_name: str):
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT IGNORE INTO qrcode_images (url, group_name, sender_name) VALUES (%s, %s, %s)",
+                (url, group_name, sender_name)
+            )
+            await conn.commit()
+            if cur.rowcount > 0:
+                print(f"💾 [{datetime.now().strftime('%H:%M:%S')}] 二维码已存库：{url}")
+
+
+async def download_image(url: str) -> bytes:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            else:
+                raise Exception(f"HTTP {resp.status}")
+
+
+def is_qr_code(image_bytes: bytes) -> bool:
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        decoded = pyzbar.decode(image)
+        return len(decoded) > 0
+    except Exception:
+        return False
+
+
+async def image_processor_worker():
+    """后台协程：持续消费图片检测任务"""
+    while True:
+        try:
+            task = await image_queue.get()
+            url = task["url"]
+            group_name = task["group_name"]
+            sender_name = task["sender_name"]
+
+            # 1. 去重检查
+            if await is_url_exists(url):
+                print(
+                    f"⏭️ [{datetime.now().strftime('%H:%M:%S')}] 图片已存在（跳过）：{url}")
+                image_queue.task_done()
+                continue
+
+            # 2. 下载图片
+            try:
+                img_data = await download_image(url)
+            except Exception as e:
+                print(
+                    f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] 下载失败 {url}: {e}")
+                image_queue.task_done()
+                continue
+
+            # 3. 识别是否为二维码（CPU-bound，但图片小可接受）
+            if is_qr_code(img_data):
+                await save_qrcode_image(url, group_name, sender_name)
+            else:
+                print(
+                    f"🖼️ [{datetime.now().strftime('%H:%M:%S')}] 非二维码（跳过）：{url}")
+
+            image_queue.task_done()
+
+        except Exception as e:
+            print(f"💥 [{datetime.now().strftime('%H:%M:%S')}] 图片处理异常: {e}")
+            image_queue.task_done()
 
 
 class WSSPeriodicSender:
     def __init__(self):
-        self.qun_lists = []  # 保存群列表
-        self.ser = 0  # 保存当前SER值
-        self.flow = None  # 保存目标WSS连接的flow
-        self.send_task = None  # 周期发送任务
-        self.is_connected = False  # 标记是否已建立有效连接
-    #
-    # def websocket_handshake(self, flow: http.HTTPFlow):
-    #     """WSS握手成功时初始化连接（避免重复创建任务）"""
-    #     print(flow.request.url)
-    #     if "weblink.netease.im/socket.io/1/websocket/" in flow.websocket.url:
-    #         # 保存有效连接的flow
-    #         self.flow = flow
-    #         self.is_connected = True
-    #         print(f"\n🔌 [{datetime.now().strftime('%H:%M:%S')}] WSS连接建立成功")
-    #
-    #         # 启动周期发送任务（仅启动一次）
-    #         if self.send_task is None or self.send_task.done():
-    #             self.send_task = asyncio.create_task(self.periodic_send_messages())
-    #             print(f"⏰ [{datetime.now().strftime('%H:%M:%S')}] 5秒周期发送任务已启动")
+        self.qun_lists = []
+        self.ser = 0
+        self.flow = None
+        self.send_task = None
+        self.is_connected = False
 
-    #  处理WebSocket消息
     def websocket_message(self, flow: http.HTTPFlow):
-        """仅处理服务端消息，更新SER值和群列表（不触发发送）"""
-        # print(f"[DEBUG] 收到一条 WebSocket 消息（来自 {flow.request.host}）")  # ← 加这行
         assert flow.websocket is not None
         last_message = flow.websocket.messages[-1]
 
-        # 仅处理目标WSS连接的服务端文本消息
         if (not last_message.from_client and last_message.is_text and
                 "weblink.netease.im/socket.io/1/websocket/" in flow.request.url):
 
             msg_content = last_message.content.decode("utf-8", errors="ignore")
 
             try:
-                # 解析Socket.IO消息，更新业务数据
                 json_data = json.loads(msg_content[4:])
                 code = json_data.get('code', -1)
 
                 if code == 200:
-                    # 同步SER值
                     self.ser = json_data.get('ser', 0)
 
-                    # 更新群列表（按需）
                     if json_data.get('sid', 0) == 8 and json_data.get('cid', 0) == 109:
                         print(
                             f"\n📩 [{datetime.now().strftime('%H:%M:%S')}] 收到群列表更新1")
@@ -79,44 +157,44 @@ class WSSPeriodicSender:
                         for v in data_list:
                             dict_json = {'name': v['3'],
                                          'id': v['1'], 't': '0'}
-                            is_exist = any(item['id'] == dict_json['id']
-                                           for item in self.qun_lists)
-                            if not is_exist:
+                            if not any(item['id'] == dict_json['id'] for item in self.qun_lists):
                                 print(f"   ✨ 新增群：{dict_json}")
                                 self.qun_lists.append(dict_json)
                             else:
                                 print(f"   ℹ️  群已存在：{dict_json}")
 
                     if json_data.get('sid', 8) == 8 and json_data.get('cid', 0) == 23:
-                        # 开始解读消息
                         print(
                             f"\n📩 [{datetime.now().strftime('%H:%M:%S')}] 收到群列表更新2")
                         data_list = json_data['r'][0]
-                        qun_name = None
                         for v in data_list:
                             if '图片' in v['17']:
                                 name = v['6']
                                 target_id = v['1']
-                                if qun_name is None:
-                                    qun_name = next(
-                                        (item['name'] for item in self.qun_lists if item['id'] == target_id), None)
+                                qun_name = next(
+                                    (item['name'] for item in self.qun_lists if item['id'] == target_id), None)
                                 img_data = json.loads(v['10'])
                                 img_url = img_data['url']
 
-                                # 解析出来的图片消息
+                                print(f"\nℹ️====收到图片消息==== [{datetime.now().strftime('%H:%M:%S')}] "
+                                      f"群名: {qun_name} 昵称：{name} | 图片连接：{img_url}")
 
-                                print(
-                                    f"\nℹ️====收到图片消息==== [{datetime.now().strftime('%H:%M:%S')}] 群名: {qun_name} 昵称：{name} | 图片连接：{img_url}")
-                        if qun_name:
-                            for item in self.qun_lists:
-                                if item['id'] == target_id:
-                                    item['t'] = data_list[-1]['12']  # 直接修改t字段
-                                    break  # 找到后退出循环，提升效率
-                    # print(f"\nℹ️ [{datetime.now().strftime('%H:%M:%S')}] 当前SER值：{self.ser} | 群数量：{len(self.qun_lists)}")
-                    if self.ser == 3 or self.is_connected == False:
+                                # 👇 异步提交图片检测任务（非阻塞！）
+                                asyncio.create_task(image_queue.put({
+                                    "url": img_url,
+                                    "group_name": qun_name or "未知群",
+                                    "sender_name": name
+                                }))
+
+                                if qun_name:
+                                    for item in self.qun_lists:
+                                        if item['id'] == target_id:
+                                            item['t'] = data_list[-1]['12']
+                                            break
+
+                    if self.ser == 3 or not self.is_connected:
                         self.flow = flow
                         self.is_connected = True
-                        # 启动周期发送任务（仅启动一次）
                         if self.send_task is None or self.send_task.done():
                             self.send_task = asyncio.create_task(
                                 self.periodic_send_messages())
@@ -129,25 +207,20 @@ class WSSPeriodicSender:
             except Exception as e:
                 print(f"❌ [{datetime.now().strftime('%H:%M:%S')}] 消息处理异常：{e}")
 
-    # 周期发送消息任务
     async def periodic_send_messages(self):
-        """周期发送消息核心逻辑（5秒一次）"""
         while self.is_connected:
             try:
-                # 检查连接有效性
-                if (self.flow is None):
+                if self.flow is None:
                     self.is_connected = False
                     print(
                         f"\n❌ [{datetime.now().strftime('%H:%M:%S')}] WSS连接已断开，停止发送")
                     break
 
-                # 执行群发逻辑
-                if self.qun_lists and len(self.qun_lists) > 0:
+                if self.qun_lists:
                     print(
                         f"\n🚀 [{datetime.now().strftime('%H:%M:%S')}] 开始执行周期发送（间隔{SEND_INTERVAL}秒）")
                     for idx, v in enumerate(self.qun_lists):
                         self.ser += 1
-                        # 构造发送消息
                         send_json_data = {
                             "SID": 8,
                             "CID": 23,
@@ -162,21 +235,22 @@ class WSSPeriodicSender:
                                 {"t": "LongArray", "v": [100]}
                             ]
                         }
-                        send_content = f"3:::{json.dumps(send_json_data, ensure_ascii=False)}"
 
-                        # 官方inject命令发送（客户端→服务端）
+                        # 只输出自己的群
+                        if "国彩大法师" in v['name']:
+                            continue
+
+                        send_content = f"3:::{json.dumps(send_json_data, ensure_ascii=False)}"
                         ctx.master.commands.call(
                             "inject.websocket",
                             self.flow,
-                            False,  # ✅ 正确：客户端→服务端
+                            False,
                             send_content.encode('utf-8')
                         )
                         print(f"✅ [{idx+1}/{len(self.qun_lists)}] 发送成功")
                         print(
                             f"----发送请求----群名：{v['name']} | SER：{self.ser} | 群ID：{v['id']}")
-                        print(f"   消息内容：{send_content[:200]}...")
 
-                # 等待指定间隔（核心：避免死循环，严格5秒一次）
                 await asyncio.sleep(SEND_INTERVAL)
 
             except asyncio.CancelledError:
@@ -185,18 +259,21 @@ class WSSPeriodicSender:
             except Exception as e:
                 print(
                     f"\n❌ [{datetime.now().strftime('%H:%M:%S')}] 周期发送异常：{e}")
-                await asyncio.sleep(SEND_INTERVAL)  # 异常仍保持5秒间隔
+                await asyncio.sleep(SEND_INTERVAL)
 
     def done(self):
-        """代理停止时清理任务"""
         if self.send_task and not self.send_task.done():
             self.send_task.cancel()
         print(f"\n👋 [{datetime.now().strftime('%H:%M:%S')}] WSS周期发送代理已停止")
 
-# 启动代理入口
-
 
 async def start_proxy():
+    global db_pool
+    await init_db()
+
+    # 启动后台图片处理器
+    asyncio.create_task(image_processor_worker())
+
     opts = options.Options(
         listen_host=PROXY_HOST,
         listen_port=PROXY_PORT,
@@ -207,16 +284,20 @@ async def start_proxy():
     sender = WSSPeriodicSender()
     master.addons.add(sender)
 
-    # 仅输出启动提示
     print("="*60)
     print(f"✅ mitmproxy 8.0 WSS周期发送代理已启动")
     print(f"📌 监听地址：http://{PROXY_HOST}:{PROXY_PORT}")
     print(f"📌 发送间隔：{SEND_INTERVAL}秒")
+    print(f"📌 二维码图片将异步存入MySQL（自动去重）")
     print("="*60)
 
     await master.run()
 
+
 if __name__ == "__main__":
+    # 安装所需包（首次运行前）：
+    # pip install mitmproxy aiohttp aiomysql Pillow pyzbar
+
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 

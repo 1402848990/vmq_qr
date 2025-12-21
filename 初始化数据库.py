@@ -1,0 +1,10 @@
+CREATE DATABASE IF NOT EXISTS weimai_db CHARACTER SET utf8mb4;
+USE weimai_db;
+
+CREATE TABLE IF NOT EXISTS qrcode_images (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    url VARCHAR(512) NOT NULL UNIQUE,
+    group_name VARCHAR(255),
+    sender_name VARCHAR(255),
+    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
