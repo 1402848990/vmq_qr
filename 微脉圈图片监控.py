@@ -15,6 +15,10 @@ import aiomysql
 from PIL import Image
 from pyzbar import pyzbar
 import io
+import hashlib
+from pyzbar import pyzbar
+from PIL import Image
+import io
 
 # ========== 全局日志配置 ==========
 logging.getLogger("mitmproxy").setLevel(logging.CRITICAL)
@@ -48,6 +52,49 @@ db_pool = None
 async def init_db():
     global db_pool
     db_pool = await aiomysql.create_pool(**MYSQL_CONFIG)
+
+
+def extract_qr_content(image_bytes: bytes):
+    """从图片中提取二维码内容（返回第一个）"""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        decoded_list = pyzbar.decode(image)
+        if decoded_list:
+            # 取第一个二维码的内容（bytes），转为字符串
+            data = decoded_list[0].data
+            # 尝试按 UTF-8 解码，失败则保留原始 bytes 的 hex
+            try:
+                return data.decode('utf-8')
+            except UnicodeDecodeError:
+                return data.hex()  # 或 base64.b64encode(data).decode()
+        return None
+    except Exception:
+        return None
+
+
+def get_md5(text: str) -> str:
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
+async def save_qrcode_if_new(url: str, qr_content: str, group_name: str, sender_name: str):
+    qr_md5 = get_md5(qr_content)
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # 使用 INSERT IGNORE 或 ON DUPLICATE KEY UPDATE
+            await cur.execute("""
+                INSERT IGNORE INTO qrcode_images 
+                (url, qr_content, qr_md5, group_name, sender_name) 
+                VALUES (%s, %s, %s, %s, %s)
+            """, (url, qr_content, qr_md5, group_name, sender_name))
+            await conn.commit()
+            if cur.rowcount > 0:
+                print(
+                    f"💾 [{datetime.now().strftime('%H:%M:%S')}] 新二维码已存库（MD5: {qr_md5[:8]}...）")
+                return True
+            else:
+                print(
+                    f"⏭️ [{datetime.now().strftime('%H:%M:%S')}] 二维码内容已存在（MD5: {qr_md5[:8]}...）")
+                return False
 
 
 async def is_url_exists(url: str) -> bool:
@@ -88,7 +135,6 @@ def is_qr_code(image_bytes: bytes) -> bool:
 
 
 async def image_processor_worker():
-    """后台协程：持续消费图片检测任务"""
     while True:
         try:
             task = await image_queue.get()
@@ -96,33 +142,28 @@ async def image_processor_worker():
             group_name = task["group_name"]
             sender_name = task["sender_name"]
 
-            # 1. 去重检查
-            if await is_url_exists(url):
-                print(
-                    f"⏭️ [{datetime.now().strftime('%H:%M:%S')}] 图片已存在（跳过）：{url}")
-                image_queue.task_done()
-                continue
-
-            # 2. 下载图片
+            # 下载图片
             try:
                 img_data = await download_image(url)
             except Exception as e:
-                print(
-                    f"⚠️ [{datetime.now().strftime('%H:%M:%S')}] 下载失败 {url}: {e}")
+                print(f"⚠️ 下载失败 {url}: {e}")
                 image_queue.task_done()
                 continue
 
-            # 3. 识别是否为二维码（CPU-bound，但图片小可接受）
-            if is_qr_code(img_data):
-                await save_qrcode_image(url, group_name, sender_name)
-            else:
-                print(
-                    f"🖼️ [{datetime.now().strftime('%H:%M:%S')}] 非二维码（跳过）：{url}")
+            # 提取二维码内容
+            qr_content = extract_qr_content(img_data)
+            if qr_content is None:
+                print(f"🖼️ 非二维码（跳过）：{url}")
+                image_queue.task_done()
+                continue
+
+            # 保存（自动去重）
+            await save_qrcode_if_new(url, qr_content, group_name, sender_name)
 
             image_queue.task_done()
 
         except Exception as e:
-            print(f"💥 [{datetime.now().strftime('%H:%M:%S')}] 图片处理异常: {e}")
+            print(f"💥 图片处理异常: {e}")
             image_queue.task_done()
 
 
