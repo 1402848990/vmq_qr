@@ -17,6 +17,11 @@ import queue
 import tkinter as tk
 from tkinter import ttk as tkttk
 import requests
+from concurrent.futures import ThreadPoolExecutor
+import weakref
+
+# 全局线程池（避免频繁创建）
+IMAGE_THREAD_POOL = ThreadPoolExecutor(max_workers=10)
 
 # 使用 ttkbootstrap 替代标准 ttk（更美观）
 try:
@@ -105,7 +110,7 @@ async def save_qrcode_if_new(url: str, qr_content: str, group_name: str, sender_
                 return False
 
 
-async def fetch_latest_images(limit=10):
+async def fetch_latest_images(limit=999):
     async with db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute("""
@@ -179,7 +184,7 @@ class WSSPeriodicSender:
                         self.log(
                             f"\n📩 [{datetime.now().strftime('%H:%M:%S')}] 收到群列表更新1")
                         data_list = json_data['r'][1]
-                        
+
                         for v in data_list:
                             dict_json = {'name': v['3'],
                                          'id': v['1'], 't': '0'}
@@ -194,7 +199,7 @@ class WSSPeriodicSender:
                             f"\n📩 [{datetime.now().strftime('%H:%M:%S')}] 收到群列表更新2")
                         data_list = json_data['r'][0]
                         last_50 = data_list[-50:]
-                        print('----消息last_50----', len(last_50), last_50)
+                        # print('----消息last_50----', len(last_50), last_50)
                         for v in last_50:
                             if '图片' in v['17']:
                                 name = v['6']
@@ -308,6 +313,13 @@ class QRCodeApp(ttk.Window):
         self.loop = None
         self.proxy_thread = None
 
+        # 控制状态
+        self.proxy_running = False
+        self.loop = None
+        self.proxy_thread = None
+        self.last_update_time = None  # 用于自动刷新判断
+        self.loading_label = None     # 加载提示标签
+
         # 构建 UI
         self.build_ui()
 
@@ -315,6 +327,81 @@ class QRCodeApp(ttk.Window):
         self.log_listener = threading.Thread(
             target=self._log_consumer, daemon=True)
         self.log_listener.start()
+
+        # 自动加载数据库中的图片
+        self.after(100, self.load_images_from_db)  # 在UI构建完成后稍后调用
+
+        # 启动自动刷新协程（需在 asyncio loop 中）
+        self.after(200, self._start_auto_refresh)  # 稍后启动
+
+        self.after(50, self._init_last_update_time)
+
+    def _init_last_update_time(self):
+        """启动时从数据库获取最新 detected_at 作为初始时间戳"""
+        if not db_pool:
+            return
+
+        def _get_latest():
+            async def _inner():
+                try:
+                    async with db_pool.acquire() as conn:
+                        async with conn.cursor(aiomysql.DictCursor) as cur:
+                            await cur.execute("SELECT MAX(detected_at) as latest FROM qrcode_images")
+                            res = await cur.fetchone()
+                            self.last_update_time = res['latest'] if res and res['latest'] else datetime.min
+                            self.gui_log(
+                                f"🕒 初始时间戳已设置: {self.last_update_time}")
+                except Exception as e:
+                    self.gui_log(f"⚠️ 初始化 last_update_time 失败: {e}")
+
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(_inner(), self.loop)
+
+        threading.Thread(target=_get_latest, daemon=True).start()
+
+    def _load_image_async(self, rec, placeholder, frame):
+        url = rec['url']
+
+        async def fetch_image():
+            try:
+                img_data = await download_image(url)
+                img = Image.open(io.BytesIO(img_data))
+                img_thumb = img.resize((100, 100), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img_thumb)
+                # 传 url 而不是 img
+                self.after(0, lambda: self._show_image(
+                    placeholder, photo, url, rec))
+            except Exception as e:
+                self.gui_log(f"下载或处理图片失败 {url}: {e}")
+
+        asyncio.run_coroutine_threadsafe(fetch_image(), self.loop)
+
+    def _start_auto_refresh(self):
+        """启动后台自动刷新（每10秒检查一次）"""
+        if not self.loop or not self.loop.is_running():
+            return
+
+        async def _auto_refresh_loop(self):
+            while True:
+                try:
+                    if db_pool:  # 不再依赖 proxy_running
+                        async with db_pool.acquire() as conn:
+                            async with conn.cursor(aiomysql.DictCursor) as cur:
+                                await cur.execute("SELECT MAX(detected_at) as latest FROM qrcode_images")
+                                result = await cur.fetchone()
+                                latest = result['latest'] if result and result['latest'] else None
+
+                        if latest and (not self.last_update_time or latest > self.last_update_time):
+                            self.gui_log("🆕 检测到新二维码，自动刷新...")
+                            self.load_images_from_db()
+                            self.last_update_time = latest
+                    await asyncio.sleep(10)
+                except Exception as e:
+                    self.gui_log(f"自动刷新异常: {e}")
+                    await asyncio.sleep(10)
+
+        # 启动协程
+        asyncio.run_coroutine_threadsafe(_auto_refresh_loop(), self.loop)
 
     def build_ui(self):
         # === 顶部按钮区域 ===
@@ -333,27 +420,45 @@ class QRCodeApp(ttk.Window):
             top_frame, text="🔄 刷新图片", command=self.load_images_from_db)
         self.btn_refresh.pack(side=LEFT, padx=5)
 
-        # === 中部图片展示区域（带滚动）===
+        # === 中部图片展示区域（横向滚动）===
         mid_frame = ttk.LabelFrame(self, text="二维码图片库", padding=10)
         mid_frame.pack(fill=BOTH, expand=YES, padx=10, pady=5)
 
-        canvas = tk.Canvas(mid_frame)
-        scrollbar = tkttk.Scrollbar(
-            mid_frame, orient="vertical", command=canvas.yview)
-        self.scrollable_frame = ttk.Frame(canvas)
+        # 创建带滚动条的 Canvas
+        self.canvas = tk.Canvas(mid_frame, bg='white')
+        v_scrollbar = tkttk.Scrollbar(
+            mid_frame, orient="vertical", command=self.canvas.yview)
+        h_scrollbar = tkttk.Scrollbar(
+            mid_frame, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=v_scrollbar.set,
+                              xscrollcommand=h_scrollbar.set)
 
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        # 内容容器
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        self.canvas.create_window(
+            (0, 0), window=self.scrollable_frame, anchor="nw")
 
-        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        # 布局
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+        mid_frame.grid_rowconfigure(0, weight=1)
+        mid_frame.grid_columnconfigure(0, weight=1)
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # 绑定滚轮（Windows & macOS）
+        def _on_mousewheel(event):
+            if event.delta:
+                self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+            else:
+                self.canvas.yview_scroll(-1 if event.num == 5 else 1, "units")
+        self.canvas.bind("<MouseWheel>", _on_mousewheel)  # Windows
+        self.canvas.bind("<Button-4>", _on_mousewheel)    # Linux up
+        self.canvas.bind("<Button-5>", _on_mousewheel)    # Linux down
 
-        self.image_labels = []
+        # 更新 scrollregion
+        def _configure_scrollable(event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.scrollable_frame.bind("<Configure>", _configure_scrollable)
 
         # === 底部日志区域 ===
         log_frame = ttk.LabelFrame(self, text="实时日志", padding=5)
@@ -364,7 +469,6 @@ class QRCodeApp(ttk.Window):
         log_scroll = tkttk.Scrollbar(
             log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
-
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
 
@@ -447,56 +551,159 @@ class QRCodeApp(ttk.Window):
             self.gui_log("⚠️ 数据库未初始化")
             return
 
+        if self.loading_label is None:
+            self.loading_label = ttk.Label(
+                self.scrollable_frame, text="⏳ 加载中...", font=("Arial", 14))
+            self.loading_label.place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            self.loading_label.lift()
+
         def _fetch_and_update():
             async def _inner():
                 try:
                     records = await fetch_all_images()
+                    if records:
+                        # 更新为最新一条的时间
+                        self.last_update_time = max(
+                            rec['detected_at'] for rec in records if rec['detected_at']
+                        )
+                    else:
+                        self.last_update_time = datetime.min
                     self.after(0, self._update_image_display, records)
                 except Exception as e:
                     self.after(0, self.gui_log, f"❌ 加载图片失败: {e}")
+                finally:
+                    self.after(0, self._hide_loading)
 
             if self.loop and self.loop.is_running():
                 asyncio.run_coroutine_threadsafe(_inner(), self.loop)
             else:
-                self.gui_log("警告：主事件循环未运行或不存在")
+                self.gui_log("警告：主事件循环未运行")
 
         threading.Thread(target=_fetch_and_update, daemon=True).start()
 
+    def _hide_loading(self):
+        if self.loading_timer:
+            self.loading_timer.cancel()
+        if self.loading_label:
+            self.loading_label.place_forget()
+
     def _update_image_display(self, records):
-        # 清空旧图
+        # 清空旧内容
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
+
+        self.loading_label = None
+
+        count = len(records)  # 计算图片数量
+        if count == 0:
+            ttk.Label(self.scrollable_frame, text="暂无二维码图片",
+                      font=("Arial", 12)).pack(pady=20)
+        else:
+            ttk.Label(self.scrollable_frame, text=f"共 {count} 张图片", font=(
+                "Arial", 12)).pack(pady=5)
+
+        # 创建一个新的Frame用于grid布局
+        grid_container = ttk.Frame(self.scrollable_frame)
+        grid_container.pack(fill=tk.BOTH, expand=True)
 
         col = 0
         row = 0
         for rec in records:
-            print('----rec----', rec)
             try:
-                # 下载图片
+                frame = ttk.Frame(grid_container, padding=5)
 
-                img_data = requests.get(rec['url'],  proxies={
-                                        "http": None, "https": None}, timeout=10).content
-                img = Image.open(io.BytesIO(img_data))
-                img.thumbnail((200, 200))  # 调整尺寸大小
-                photo = ImageTk.PhotoImage(img)
+                # 占位图（防止布局抖动）
+                placeholder = ttk.Label(
+                    frame, text="加载中...", width=25, anchor="center")
+                placeholder.grid(row=0, column=0, sticky="nsew")
 
-                frame = ttk.Frame(self.scrollable_frame, padding=5)
-                label_img = ttk.Label(frame, image=photo)
-                label_img.image = photo  # 防止被回收
-                label_img.pack()
+                # 异步加载图片（不阻塞 GUI）
+                self._load_image_async(rec, placeholder, frame)
 
-                info = f"{rec['group_name']} | {rec['sender_name']}"
-                ttk.Label(frame, text=info[:30], font=("Arial", 8)).pack()
-                frame.grid(row=row, column=col, padx=5, pady=5)
+                # 显示群名和时间
+                group_name = rec.get('group_name', '未知群')
+                detected_at = rec.get('detected_at')
+                time_str = detected_at.strftime(
+                    "%m-%d %H:%M") if detected_at else "未知时间"
+                info = f"{group_name} | {time_str}"
+                ttk.Label(frame, text=info[:30], font=("Arial", 8)).grid(
+                    row=1, column=0, sticky="nsew")
 
+                frame.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
                 col += 1
-                if col >= 4:  # 每行展示4张图片
+                if col >= 10:  # 一行10张
                     col = 0
                     row += 1
 
             except Exception as e:
-                self.gui_log(f"跳过损坏或无法加载的图片: {e}")
-                continue  # 跳过损坏图片或加载失败的情况
+                self.gui_log(f"构建图片项失败: {e}")
+                continue
+
+        # 更新滚动区域
+        self.after(100, lambda: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+
+    def _show_image(self, placeholder, photo, url, rec):  # 注意：这里 img 改成 url
+        placeholder.config(image=photo, text="")
+        placeholder.image = photo
+
+        def on_click(event):
+            self._show_full_image(url, rec)  # 传 url
+        placeholder.bind("<Button-1>", on_click)
+        placeholder.config(cursor="hand2")
+
+    def _show_full_image(self, url, rec):
+        """弹出新窗口，从 URL 下载原图并显示"""
+        top = tk.Toplevel(self)
+        top.title(f"大图预览 - {rec.get('group_name', '')}")
+        top.geometry("400x400")  # 初始大小
+        top.resizable(True, True)
+
+        # 显示加载中
+        label = ttk.Label(top, text="正在加载原图...", font=("Arial", 12))
+        label.pack(expand=True)
+
+        def _download_and_show():
+            try:
+                # 同步下载（在子线程）
+                response = requests.get(
+                    url, proxies={"http": None, "https": None}, timeout=10)
+                response.raise_for_status()
+                img = Image.open(io.BytesIO(response.content))
+
+                # 计算缩放尺寸（最大 1200x1200）
+                width, height = img.size
+                max_size = 1200
+                if width > max_size or height > max_size:
+                    scale = max_size / max(width, height)
+                    new_w, new_h = int(width * scale), int(height * scale)
+                else:
+                    new_w, new_h = width, height
+
+                # 调整窗口大小
+                x = (top.winfo_screenwidth() - new_w) // 2
+                y = (top.winfo_screenheight() - new_h) // 2
+                top.geometry(f"{new_w}x{new_h}+{x}+{y}")
+
+                # 缩放图片（保持清晰）
+                img_resized = img.resize(
+                    (new_w, new_h), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img_resized)
+
+                # 更新 Label
+                label.config(image=photo, text="")
+                label.image = photo  # 防止回收
+
+                # 添加信息
+                info = f"群: {rec.get('group_name', 'N/A')} | 发送者: {rec.get('sender_name', 'N/A')}"
+                ttk.Label(top, text=info, font=("Arial", 10)).pack(pady=5)
+
+            except Exception as e:
+                label.config(text=f"❌ 加载失败: {e}")
+
+        # 在后台线程下载，避免卡死 GUI
+        threading.Thread(target=_download_and_show, daemon=True).start()
 
     def on_closing(self):
         self.stop_proxy()
