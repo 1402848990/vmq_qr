@@ -37,7 +37,8 @@ PROXY_PORT = 8080
 SEND_INTERVAL = 15
 
 MYSQL_CONFIG = {
-    "host": "127.0.0.1",
+    # "host": "8.217.1.0",
+     "host": "127.0.0.1",
     "port": 3306,
     "user": "root",
     "password": "123456",
@@ -90,7 +91,7 @@ async def init_db():
     db_pool = await aiomysql.create_pool(**MYSQL_CONFIG)
 
 
-async def save_qrcode_if_new(url: str, qr_content: str, group_name: str, sender_name: str, log_func):
+async def save_qrcode_if_new(url: str, qr_content: str, group_name: str, sender_name: str, log_func, app_instance):
     qr_md5 = get_md5(qr_content)
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
@@ -102,13 +103,13 @@ async def save_qrcode_if_new(url: str, qr_content: str, group_name: str, sender_
             await conn.commit()
             if cur.rowcount > 0:
                 log_func(
-                    f"💾 [{datetime.now().strftime('%H:%M:%S')}] 新二维码已存库（MD5: {qr_md5[:8]}...）")
-                return True
+                    f"💾 [{datetime.now().strftime('%H:%M:%S')}] 新二维码已存库（标识: {qr_md5[:8]}...）")
+                # 刷新图片显示
+                app_instance.refresh_images()
             else:
+                # print(f"⏭️ [{datetime.now().strftime('%H:%M:%S')}] 二维码内容已存在（MD5: {qr_md5[:8]}...）")
                 log_func(
-                    f"⏭️ [{datetime.now().strftime('%H:%M:%S')}] 二维码内容已存在（MD5: {qr_md5[:8]}...）")
-                return False
-
+                    f"⏭️ [{datetime.now().strftime('%H:%M:%S')}] 二维码内容已存在（标识: {qr_md5[:8]}...）")
 
 async def fetch_latest_images(limit=999):
     async with db_pool.acquire() as conn:
@@ -124,7 +125,7 @@ async def fetch_latest_images(limit=999):
 # ========== 图片处理工作线程 ==========
 
 
-async def image_processor_worker(log_func):
+async def image_processor_worker(log_func,app_instance):
     while True:
         try:
             task = await image_queue.get()
@@ -141,11 +142,12 @@ async def image_processor_worker(log_func):
 
             qr_content = extract_qr_content(img_data)
             if qr_content is None:
-                log_func(f"🖼️ 非二维码（跳过）：{url}")
+                # print(f"🖼️ 非二维码（跳过）：{url}")
+                # log_func(f"🖼️ 非二维码（跳过）：{url}")
                 image_queue.task_done()
                 continue
 
-            await save_qrcode_if_new(url, qr_content, group_name, sender_name, log_func)
+            await save_qrcode_if_new(url, qr_content, group_name, sender_name, log_func,app_instance)
             image_queue.task_done()
 
         except Exception as e:
@@ -198,7 +200,7 @@ class WSSPeriodicSender:
                         self.log(
                             f"\n📩 [{datetime.now().strftime('%H:%M:%S')}] 收到群列表更新2")
                         data_list = json_data['r'][0]
-                        last_50 = data_list[-50:]
+                        last_50 = data_list[-30:]
                         # print('----消息last_50----', len(last_50), last_50)
                         for v in last_50:
                             if '图片' in v['17']:
@@ -209,8 +211,8 @@ class WSSPeriodicSender:
                                 img_data = json.loads(v['10'])
                                 img_url = img_data['url']
 
-                                self.log(f"\nℹ️====收到图片消息==== [{datetime.now().strftime('%H:%M:%S')}] "
-                                         f"群名: {qun_name} 昵称：{name} | 图片连接：{img_url}")
+                                # self.log(f"\nℹ️====收到图片消息==== [{datetime.now().strftime('%H:%M:%S')}] "
+                                #          f"群名: {qun_name} 昵称：{name} | 图片连接：{img_url}")
 
                                 asyncio.create_task(image_queue.put({
                                     "url": img_url,
@@ -282,7 +284,7 @@ class WSSPeriodicSender:
                         self.log(f"✅ [{idx+1}/{len(self.qun_lists)}] 发送成功")
                         self.log(
                             f"----发送请求----群名：{v['name']} | SER：{self.ser} | 群ID：{v['id']}")
-
+                self.log(f"监听中...")
                 await asyncio.sleep(SEND_INTERVAL)
 
             except asyncio.CancelledError:
@@ -292,7 +294,9 @@ class WSSPeriodicSender:
             except Exception as e:
                 self.log(
                     f"\n❌ [{datetime.now().strftime('%H:%M:%S')}] 周期发送异常：{e}")
+                self.log(f"监听中...")
                 await asyncio.sleep(SEND_INTERVAL)
+                
 
     def done(self):
         if self.send_task and not self.send_task.done():
@@ -304,7 +308,7 @@ class WSSPeriodicSender:
 class QRCodeApp(ttk.Window):
     def __init__(self):
         super().__init__(themename="litera")
-        self.title("二维码监控代理系统")
+        self.title("vmq二维码监控系统")
         self.geometry("1800x1000")
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -332,9 +336,14 @@ class QRCodeApp(ttk.Window):
         self.after(100, self.load_images_from_db)  # 在UI构建完成后稍后调用
 
         # 启动自动刷新协程（需在 asyncio loop 中）
-        self.after(200, self._start_auto_refresh)  # 稍后启动
+        # self.after(200, self._start_auto_refresh)  # 稍后启动
 
         self.after(50, self._init_last_update_time)
+        
+
+    def refresh_images(self):
+        """刷新图片显示的方法"""
+        self.load_images_from_db()
 
     def _init_last_update_time(self):
         """启动时从数据库获取最新 detected_at 作为初始时间戳"""
@@ -376,32 +385,32 @@ class QRCodeApp(ttk.Window):
 
         asyncio.run_coroutine_threadsafe(fetch_image(), self.loop)
 
-    def _start_auto_refresh(self):
-        """启动后台自动刷新（每10秒检查一次）"""
-        if not self.loop or not self.loop.is_running():
-            return
+    # def _start_auto_refresh(self):
+    #     """启动后台自动刷新（每10秒检查一次）"""
+    #     if not self.loop or not self.loop.is_running():
+    #         return
 
-        async def _auto_refresh_loop(self):
-            while True:
-                try:
-                    if db_pool:  # 不再依赖 proxy_running
-                        async with db_pool.acquire() as conn:
-                            async with conn.cursor(aiomysql.DictCursor) as cur:
-                                await cur.execute("SELECT MAX(detected_at) as latest FROM qrcode_images")
-                                result = await cur.fetchone()
-                                latest = result['latest'] if result and result['latest'] else None
+    #     async def _auto_refresh_loop(self):
+    #         while True:
+    #             try:
+    #                 if db_pool:  # 不再依赖 proxy_running
+    #                     async with db_pool.acquire() as conn:
+    #                         async with conn.cursor(aiomysql.DictCursor) as cur:
+    #                             await cur.execute("SELECT MAX(detected_at) as latest FROM qrcode_images")
+    #                             result = await cur.fetchone()
+    #                             latest = result['latest'] if result and result['latest'] else None
 
-                        if latest and (not self.last_update_time or latest > self.last_update_time):
-                            self.gui_log("🆕 检测到新二维码，自动刷新...")
-                            self.load_images_from_db()
-                            self.last_update_time = latest
-                    await asyncio.sleep(10)
-                except Exception as e:
-                    self.gui_log(f"自动刷新异常: {e}")
-                    await asyncio.sleep(10)
+    #                     if latest and (not self.last_update_time or latest > self.last_update_time):
+    #                         self.gui_log("🆕 检测到新二维码，自动刷新...")
+    #                         self.load_images_from_db()
+    #                         self.last_update_time = latest
+    #                 await asyncio.sleep(10)
+    #             except Exception as e:
+    #                 self.gui_log(f"自动刷新异常: {e}")
+    #                 await asyncio.sleep(10)
 
-        # 启动协程
-        asyncio.run_coroutine_threadsafe(_auto_refresh_loop(), self.loop)
+    #     # 启动协程
+    #     asyncio.run_coroutine_threadsafe(_auto_refresh_loop(), self.loop)
 
     def build_ui(self):
         # === 顶部按钮区域 ===
@@ -409,15 +418,15 @@ class QRCodeApp(ttk.Window):
         top_frame.pack(fill=X, padx=10, pady=5)
 
         self.btn_start = ttk.Button(
-            top_frame, text="▶ 启动代理", command=self.start_proxy, bootstyle=SUCCESS)
+            top_frame, text="▶ 开始运行", command=self.start_proxy, bootstyle=SUCCESS)
         self.btn_start.pack(side=LEFT, padx=5)
 
         self.btn_stop = ttk.Button(
-            top_frame, text="⏹ 停止代理", command=self.stop_proxy, bootstyle=DANGER, state=DISABLED)
+            top_frame, text="⏹ 停止运行", command=self.stop_proxy, bootstyle=DANGER, state=DISABLED)
         self.btn_stop.pack(side=LEFT, padx=5)
 
         self.btn_refresh = ttk.Button(
-            top_frame, text="🔄 刷新图片", command=self.load_images_from_db)
+            top_frame, text="🔄 查看|刷新二维码图片库", command=self.load_images_from_db)
         self.btn_refresh.pack(side=LEFT, padx=5)
 
         # === 中部图片展示区域（横向滚动）===
@@ -504,6 +513,8 @@ class QRCodeApp(ttk.Window):
         self.proxy_thread = threading.Thread(
             target=self._run_proxy_in_thread, daemon=True)
         self.proxy_thread.start()
+        
+
 
     def _run_proxy_in_thread(self):
         self.loop = asyncio.new_event_loop()
@@ -519,7 +530,7 @@ class QRCodeApp(ttk.Window):
 
     async def _start_proxy_async(self):
         await init_db()
-        asyncio.create_task(image_processor_worker(self.gui_log))
+        asyncio.create_task(image_processor_worker(self.gui_log,self))
 
         opts = options.Options(
             listen_host=PROXY_HOST,
@@ -537,6 +548,7 @@ class QRCodeApp(ttk.Window):
         self.gui_log("="*60)
 
         await master.run()
+        # self.refresh_images(self)
 
     def stop_proxy(self):
         if self.loop and self.proxy_running:
@@ -587,6 +599,7 @@ class QRCodeApp(ttk.Window):
             self.loading_timer.cancel()
         if self.loading_label:
             self.loading_label.place_forget()
+            self.loading_label = None
 
     def _update_image_display(self, records):
         # 清空旧内容
@@ -653,11 +666,12 @@ class QRCodeApp(ttk.Window):
         placeholder.bind("<Button-1>", on_click)
         placeholder.config(cursor="hand2")
 
+
     def _show_full_image(self, url, rec):
         """弹出新窗口，从 URL 下载原图并显示"""
         top = tk.Toplevel(self)
-        top.title(f"大图预览 - {rec.get('group_name', '')}")
-        top.geometry("400x400")  # 初始大小
+        top.title(f"二维码预览 - {rec.get('group_name', '')}")
+        top.geometry("0x0")  # 初始大小
         top.resizable(True, True)
 
         # 显示加载中
@@ -684,7 +698,7 @@ class QRCodeApp(ttk.Window):
                 # 调整窗口大小
                 x = (top.winfo_screenwidth() - new_w) // 2
                 y = (top.winfo_screenheight() - new_h) // 2
-                top.geometry(f"{new_w}x{new_h}+{x}+{y}")
+                top.geometry(f"{new_w+200}x{new_h + 200}+{x}+{y}")
 
                 # 缩放图片（保持清晰）
                 img_resized = img.resize(
@@ -696,7 +710,7 @@ class QRCodeApp(ttk.Window):
                 label.image = photo  # 防止回收
 
                 # 添加信息
-                info = f"群: {rec.get('group_name', 'N/A')} | 发送者: {rec.get('sender_name', 'N/A')}"
+                info = f"群: {rec.get('group_name', 'N/A')} | 发送者: {rec.get('sender_name', 'N/A')} | 时间： {rec.get('detected_at', 'N/A')}"
                 ttk.Label(top, text=info, font=("Arial", 10)).pack(pady=5)
 
             except Exception as e:
@@ -729,7 +743,7 @@ if __name__ == "__main__":
 
     # 初始化数据库并启动 GUI
     async def init_and_run():
-        global db_pool
+        global db_pool,app
         db_pool = await aiomysql.create_pool(**MYSQL_CONFIG)
         app = QRCodeApp()
         app.mainloop()  # 注意：mainloop() 是阻塞的，不会返回
